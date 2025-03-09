@@ -51,6 +51,29 @@ document.getElementById('start-button').addEventListener('click', async () => {
   await processVideos(files, finalLength, minClipLength, maxClipLength, zoomProbability, minZoom, maxZoom, finalWidth, finalHeight, flipProbability);
 });
 
+// New helper function for iOS video playback
+async function playVideo(video) {
+  try {
+    // iOS often requires user interaction, but muted videos can autoplay
+    await video.play();
+    return true;
+  } catch (error) {
+    console.error("Playback failed:", error);
+    // If play fails, try a timeout and retry
+    return new Promise((resolve) => {
+      setTimeout(async () => {
+        try {
+          await video.play();
+          resolve(true);
+        } catch (e) {
+          console.error("Retry failed:", e);
+          resolve(false);
+        }
+      }, 100);
+    });
+  }
+}
+
 async function processVideos(files, finalLength, minClipLength, maxClipLength, zoomProbability, minZoom, maxZoom, finalWidth, finalHeight, flipProbability) {
   updateProgress('Initializing processing...');
   const canvas = document.createElement('canvas');
@@ -64,18 +87,30 @@ async function processVideos(files, finalLength, minClipLength, maxClipLength, z
   // Use a captureStream frame rate of 30 FPS (can be adjusted)
   const stream = canvas.captureStream(30);
 
-  // Use H.264 codec and set a bitrate of 8 Mbps (8,000,000 bps)
+  // Use more compatible settings for iOS
   let options = {
-      mimeType: 'video/mp4; codecs="avc1.42E01E"',
-      videoBitsPerSecond: 8000000
+    mimeType: 'video/mp4',  // Remove specific codec
+    videoBitsPerSecond: 2000000  // Lower bitrate for better compatibility
   };
 
   let recorder;
   try {
-      recorder = new MediaRecorder(stream, options);
+    recorder = new MediaRecorder(stream, options);
   } catch (e) {
-      updateProgress('H.264 configuration not supported, using default settings.');
+    try {
+      // First fallback: try without options
+      updateProgress('Default video/mp4 not supported, trying without options.');
       recorder = new MediaRecorder(stream);
+    } catch (e2) {
+      try {
+        // Last resort: try with webm
+        updateProgress('Falling back to webm format.');
+        recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+      } catch (e3) {
+        updateProgress('Media recording not supported on this device. Try using Safari on iOS.');
+        throw new Error('Media recording not supported');
+      }
+    }
   }
 
   recorder.ondataavailable = (e) => chunks.push(e.data);
@@ -124,11 +159,13 @@ async function processVideos(files, finalLength, minClipLength, maxClipLength, z
   const videoPlayers = [];
   for (let i = 0; i < 4; i++) {
       const video = document.createElement('video');
-      // Prevent full-screen on iPhone by enabling inline playback.
+      // Enhanced iOS compatibility settings
       video.setAttribute('playsinline', 'true');
       video.setAttribute('webkit-playsinline', 'true');
+      video.setAttribute('controls', 'false');
+      video.playsInline = true;
       video.muted = true;
-      video.autoplay = true;
+      video.autoplay = false;  // Start with autoplay off
       videoPlayers.push(video);
   }
 
@@ -211,6 +248,8 @@ async function processVideos(files, finalLength, minClipLength, maxClipLength, z
 function getVideoDuration(file) {
   return new Promise((resolve) => {
       const tempVideo = document.createElement('video');
+      tempVideo.setAttribute('playsinline', 'true');  // Add iOS compatibility
+      tempVideo.muted = true;  // Add muted for iOS
       tempVideo.src = URL.createObjectURL(file);
       tempVideo.onloadedmetadata = () => resolve(tempVideo.duration);
   });
@@ -229,19 +268,35 @@ function getRandomStartTime(duration, clipLength) {
 function preloadClip(video, file, startTime, clipLength) {
   return new Promise((resolve, reject) => {
       video.src = URL.createObjectURL(file);
-      video.currentTime = startTime;
-      video.onloadedmetadata = () => {
-          video.onseeked = () => resolve();
-          video.onerror = (e) => reject(e);
-      };
-      video.onerror = (e) => reject(e);
+      
+      // Use explicit event listener for loadedmetadata instead of onloadedmetadata
+      video.addEventListener('loadedmetadata', () => {
+          video.currentTime = startTime;
+          
+          // Use explicit event listener for seeked
+          video.addEventListener('seeked', () => {
+              resolve();
+          }, { once: true });
+          
+          // Error handling
+          video.addEventListener('error', (e) => {
+              console.error("Video error during preload:", e);
+              reject(e);
+          }, { once: true });
+      }, { once: true });
+      
+      // Error handling outside loadedmetadata
+      video.addEventListener('error', (e) => {
+          console.error("Video error during loading:", e);
+          reject(e);
+      }, { once: true });
   });
 }
 
 // Play a clip by drawing frames from the video onto the canvas.
 // The drawFrame function stops drawing when the elapsed time reaches finalLength.
 function playActiveClip(video, clipConf, canvas, ctx, zoomConfig, previousClip, recordStartTime, finalLength) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
       const { startTime, clipLength, file } = clipConf;
       const clipEndTime = startTime + clipLength;
       const overlapDuration = 1.0; // 1 second overlap
@@ -284,48 +339,55 @@ function playActiveClip(video, clipConf, canvas, ctx, zoomConfig, previousClip, 
           updateProgress(`Applied horizontal flip on ${file.name}`);
       }
       
-      video.play().then(() => {
-          const drawFrame = () => {
-              if (performance.now() - recordStartTime >= finalLength * 1000) {
-                  resolve();
-                  return;
-              }
-              ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Use our new playVideo helper function for iOS compatibility
+      const playbackSuccess = await playVideo(video);
+      if (!playbackSuccess) {
+          updateProgress(`Warning: Playback issue with ${file.name}. Skipping to next clip.`);
+          resolve();
+          return;
+      }
 
-              // Draw previous clip during the overlap period.
-              if (previousClip && video.currentTime < startTime + overlapDuration) {
-                  ctx.drawImage(previousClip.video, 0, 0, canvas.width, canvas.height);
-              }
-              
-              // If flipping is applied, flip the context before drawing.
-              if (flipClip) {
-                  ctx.save();
-                  ctx.translate(canvas.width, 0);
-                  ctx.scale(-1, 1);
-              }
+      const drawFrame = () => {
+          if (performance.now() - recordStartTime >= finalLength * 1000) {
+              resolve();
+              return;
+          }
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+          // Draw previous clip during the overlap period.
+          if (previousClip && video.currentTime < startTime + overlapDuration) {
+              ctx.drawImage(previousClip.video, 0, 0, canvas.width, canvas.height);
+          }
+          
+          // If flipping is applied, flip the context before drawing.
+          if (flipClip) {
+              ctx.save();
+              ctx.translate(canvas.width, 0);
+              ctx.scale(-1, 1);
+          }
+
+          try {
               if (applyZoom) {
                   ctx.drawImage(video, fixedOffsetX, fixedOffsetY, zoomedSW, zoomedSH, 0, 0, canvas.width, canvas.height);
               } else {
                   // Draw the full video frame.
                   ctx.drawImage(video, baseSX, baseSY, baseSW, baseSH, 0, 0, canvas.width, canvas.height);
               }
-              
-              if (flipClip) {
-                  ctx.restore();
-              }
-              
-              if (video.currentTime >= clipEndTime) {
-                  resolve();
-              } else {
-                  requestAnimationFrame(drawFrame);
-              }
-          };
-          drawFrame();
-      }).catch((e) => {
-          updateProgress(`Error playing clip from file ${file.name}: ${e.message}`);
-          console.error(`Error playing clip from file: ${file.name}`, e);
-          reject(e);
-      });
+          } catch (e) {
+              console.error("Error drawing video frame:", e);
+          }
+          
+          if (flipClip) {
+              ctx.restore();
+          }
+          
+          if (video.currentTime >= clipEndTime) {
+              resolve();
+          } else {
+              requestAnimationFrame(drawFrame);
+          }
+      };
+      
+      drawFrame();
   });
 }
